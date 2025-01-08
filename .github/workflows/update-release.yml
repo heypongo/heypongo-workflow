@@ -1,0 +1,96 @@
+name: Reusable Release Label Workflow
+
+on:
+  workflow_call:
+    secrets:
+      GITHUB_TOKEN:
+        required: true
+
+jobs:
+  update-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name 'GitHub Action'
+          git config user.email 'action@github.com'
+
+      - name: Get all PRs with release label
+        id: get_prs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            const releasePRs = prs.data.filter(pr => 
+              pr.labels.some(label => label.name === 'release')
+            );
+            
+            return releasePRs.map(pr => pr.number);
+          result-encoding: string
+
+      - name: Rebuild release branch
+        id: update
+        continue-on-error: true
+        run: |
+          git fetch origin dev
+          git branch -D release || true
+          git checkout -b release origin/dev
+          
+          PR_NUMBERS='${{ steps.get_prs.outputs.result }}'
+          
+          echo "Found PRs with release label: $PR_NUMBERS"
+          
+          for PR_NUMBER in $(echo $PR_NUMBERS | tr ',' ' '); do
+            echo "Processing PR #$PR_NUMBER"
+            git fetch origin pull/$PR_NUMBER/head:pr-$PR_NUMBER
+            
+            COMMITS=$(git log --reverse --format="%H" origin/dev..pr-$PR_NUMBER)
+            
+            for commit in $COMMITS; do
+              if ! git cherry-pick $commit; then
+                git cherry-pick --abort
+                echo "status=failed" >> $GITHUB_OUTPUT
+                echo "error=Conflict detected during cherry-pick of PR #$PR_NUMBER" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            done
+          done
+          
+          git push --force origin release
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Comment PR Success
+        if: steps.update.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ Release branch has been recreated from dev and updated with all PRs containing the release label'
+            })
+
+      - name: Comment PR Failure
+        if: steps.update.outputs.status == 'failed'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '❌ Error while updating release branch\n\nError: ' + 
+                    '${{ steps.update.outputs.error }}\n\nPlease handle this manually.'
+            })
